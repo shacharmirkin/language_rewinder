@@ -332,7 +332,7 @@ css = """
 }
 """
 
-with gr.Blocks(title="Language Rewinder") as demo:
+with gr.Blocks(title="Language Rewinder", theme=theme, css=css) as demo:
     gr.Markdown("# ⏪ Language Rewinder")
     gr.Markdown("Adapt your writing for historical accuracy and translate modern slang into the language of the past.")
     
@@ -371,4 +371,8 @@ with gr.Blocks(title="Language Rewinder") as demo:
         label="Try these modern examples"
     )
 
-demo.queue(default_concurrency_limit=5).launch(theme=theme, css=css)
+demo.queue(default_concurrency_limit=5).launch(
+    server_name="0.0.0.0",
+    server_port=int(os.environ.get("PORT", 7860)),
+    ssr_mode=False,
+)
