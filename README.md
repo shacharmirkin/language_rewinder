@@ -15,7 +15,7 @@ pinned: false
 
 Language Rewinder transforms modern writing into historically grounded language for a chosen year or decade.
 
-The app uses *Gemini 2.5 flash* to rewrite modern wording into era-appropriate vocabulary and tone, while avoiding obvious anachronisms for the selected period. In addition to the adapted text it returns a short etymology note explaining key substitutions.
+The app uses *Gemini* to rewrite modern wording into era-appropriate vocabulary and tone, while avoiding obvious anachronisms for the selected period. In addition to the adapted text it returns a short etymology note explaining key substitutions.
 
 ## How it works
 

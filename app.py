@@ -16,9 +16,8 @@ load_dotenv()
 
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
+#MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MODEL_NAME = "gemini-2.5-flash"
-INPUT_COST_PER_1M_TOKENS_USD = 0.30
-OUTPUT_COST_PER_1M_TOKENS_USD = 2.50
 
 def pick_storage_root():
     if os.environ.get("LTM_STORAGE_DIR"):
@@ -73,38 +72,75 @@ if not logger.handlers:
     file_handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(file_handler)
 
+# TODO switch to structured output
 SYSTEM_PROMPT = """
 You are a Historical Linguist and Translator. Your goal is to rewrite modern text into the vocabulary, 
 syntax, and slang of a specific year or decade. 
 
 RULES:
 1. ANCHRONISM FILTER: Strictly avoid words, concepts, or technologies that did not exist in the target year.
-2. CULTURAL VIBE: Adopt the social tone of the era (e.g., the earnestness of the 40s, the groove of the 70s).
+2. CULTURAL VIBE: Adopt the social tone of the era (e.g., the earnest restraint of 1940s Europe, the laid-back groove of 1970s America).
 3. EXPLANATION: After the translation, provide a short 'Etymology Note' explaining why you replaced certain modern words.
-4. LANGUAGE TRANSFER: If the input is not in English, translate it into the target year's equivalent within that same language. Do not translate between languages (e.g., French stays French).
+4. LANGUAGE: If the input is not in English, translate it into the target year's equivalent within that same language. Do not translate between languages (e.g., French stays French).
+
+OUTPUT FORMAT (MANDATORY):
+- Return plain Markdown only.
+- First line must be exactly: **<TARGET_YEAR> <LANGUAGE_NAME_IN_ENGLISH>:**
+- Then write only the translated text.
+- Then write exactly this header on its own line: **Etymology Note:**
+- Then 2-4 short bullet points.
 """
 
 def log_request(event_data):
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": MODEL_NAME,
         **event_data,
     }
     logger.info(json.dumps(payload, ensure_ascii=False))
+
+def normalize_output_text(raw_text, target_year):
+    lines = raw_text.strip().splitlines()
+    normalized_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            continue
+
+        heading_candidate = re.sub(r"^#{1,6}\s*", "", stripped)
+        heading_candidate = heading_candidate.strip()
+        heading_candidate = re.sub(r"^\*{1,2}\s*(.*?)\s*\*{1,2}$", r"\1", heading_candidate)
+        heading_candidate = heading_candidate.strip()
+
+        if re.fullmatch(r"etymology note:?", heading_candidate, flags=re.IGNORECASE):
+            normalized_lines.append("**Etymology Note:**")
+            continue
+
+        normalized_lines.append(line)
+
+    cleaned_text = "\n".join(normalized_lines)
+    cleaned_text = re.sub(r"(?m)^\s*\*{1,2}\s*$", "", cleaned_text)
+    cleaned_text = re.sub(
+        r"(?im)^\s*\*{0,2}\s*etymology note:\s*\*{0,2}\s*$",
+        "**Etymology Note:**",
+        cleaned_text,
+    )
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
+    cleaned_text = re.sub(
+        r"\n*\*\*Etymology Note:\*\*\n*",
+        "\n\n**Etymology Note:**\n",
+        cleaned_text,
+        flags=re.IGNORECASE,
+    )
+    cleaned_text = cleaned_text.strip()
+    return cleaned_text
 
 def extract_usage_and_cost(response):
     usage = getattr(response, "usage_metadata", None)
     input_tokens = getattr(usage, "prompt_token_count", None) if usage else None
     output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
 
-    input_cost_usd = None
-    output_cost_usd = None
-    total_cost_usd = None
-    if input_tokens is not None and output_tokens is not None:
-        input_cost_usd = (input_tokens / 1_000_000) * INPUT_COST_PER_1M_TOKENS_USD
-        output_cost_usd = (output_tokens / 1_000_000) * OUTPUT_COST_PER_1M_TOKENS_USD
-        total_cost_usd = input_cost_usd + output_cost_usd
-
-    return input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd
+    return input_tokens, output_tokens, None, None, None
 
 def get_cached_output(cache_key):
     now_ts = int(time.time())
@@ -157,12 +193,13 @@ def translate_text(user_input, target_year):
     cache_key = hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
     cached_output = get_cached_output(cache_key)
     if cached_output is not None:
+        normalized_cached_output = normalize_output_text(cached_output, target_year)
         log_request(
             {
                 "model": MODEL_NAME,
                 "target_year": target_year,
                 "input_text": user_input,
-                "output_text": cached_output,
+                "output_text": normalized_cached_output,
                 "error_text": None,
                 "cache_hit": True,
                 "input_tokens": None,
@@ -172,7 +209,7 @@ def translate_text(user_input, target_year):
                 "total_cost_usd": 0.0,
             }
         )
-        return cached_output
+        return normalized_cached_output
     
     try:
         response = client.models.generate_content(
@@ -180,11 +217,15 @@ def translate_text(user_input, target_year):
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT
             ),
-            contents=f"Target Year: {target_year}\nText: {user_input}"
+            contents=(
+                f"Target Year: {target_year}\n"
+                "Follow the exact output format from the system prompt. "
+                "Do not add any extra label before the translation body.\n"
+                f"Text: {user_input}"
+            )
         )
         
-        # Intercept the response and squash multiple newlines down to just one
-        cleaned_text = re.sub(r'\n{2,}', '\n', response.text.strip())
+        cleaned_text = normalize_output_text(response.text, target_year)
         input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd = extract_usage_and_cost(response)
         set_cached_output(cache_key, cleaned_text)
         log_request(
@@ -332,7 +373,7 @@ css = """
 }
 """
 
-with gr.Blocks(title="Language Rewinder", theme=theme, css=css) as demo:
+with gr.Blocks(title="Language Rewinder") as demo:
     gr.Markdown("# ⏪ Language Rewinder")
     gr.Markdown("Adapt your writing for historical accuracy and translate modern slang into the language of the past.")
     
@@ -375,4 +416,6 @@ demo.queue(default_concurrency_limit=5).launch(
     server_name="0.0.0.0",
     server_port=int(os.environ.get("PORT", 7860)),
     ssr_mode=False,
+    theme=theme,
+    css=css,
 )
