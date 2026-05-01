@@ -10,19 +10,35 @@ import threading
 import logging
 import json
 from datetime import datetime, timezone
+import time
 
 load_dotenv()
 
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 MODEL_NAME = "gemini-2.5-flash"
+INPUT_COST_PER_1M_TOKENS_USD = 0.30
+OUTPUT_COST_PER_1M_TOKENS_USD = 2.50
 
-if os.environ.get("SPACE_ID"):
-    cache_db_path = os.environ.get("LLM_CACHE_DB_PATH", "/tmp/ling_time_machine_cache.sqlite3")
-    log_path = os.environ.get("LLM_LOG_PATH", "/tmp/ling_time_machine_requests.log")
-else:
-    cache_db_path = os.environ.get("LLM_CACHE_DB_PATH", ".cache/ling_time_machine_cache.sqlite3")
-    log_path = os.environ.get("LLM_LOG_PATH", ".logs/ling_time_machine_requests.log")
+def pick_storage_root():
+    if os.environ.get("LTM_STORAGE_DIR"):
+        return os.environ["LTM_STORAGE_DIR"]
+    if os.environ.get("SPACE_ID"):
+        # HF persistent storage (paid) is mounted at /data.
+        if os.path.isdir("/data") and os.access("/data", os.W_OK):
+            return "/data/lang_rewinder"
+        return "/tmp/lang_rewinder"
+    return "."
+
+storage_root = pick_storage_root()
+cache_db_path = os.environ.get(
+    "LLM_CACHE_DB_PATH",
+    os.path.join(storage_root, ".cache", "lang_rewinder_cache.sqlite3"),
+)
+log_path = os.environ.get(
+    "LLM_LOG_PATH",
+    os.path.join(storage_root, ".logs", "lang_rewinder_requests.log"),
+)
 
 cache_dir = os.path.dirname(cache_db_path)
 if cache_dir:
@@ -39,13 +55,18 @@ with cache_lock:
         """
         CREATE TABLE IF NOT EXISTS llm_cache (
             cache_key TEXT PRIMARY KEY,
-            output_text TEXT NOT NULL
+            output_text TEXT NOT NULL,
+            expires_at INTEGER
         )
         """
     )
+    try:
+        cache_conn.execute("ALTER TABLE llm_cache ADD COLUMN expires_at INTEGER")
+    except sqlite3.OperationalError:
+        pass
     cache_conn.commit()
 
-logger = logging.getLogger("ling_time_machine")
+logger = logging.getLogger("lang_rewinder")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     file_handler = logging.FileHandler(log_path)
@@ -70,6 +91,46 @@ def log_request(event_data):
     }
     logger.info(json.dumps(payload, ensure_ascii=False))
 
+def extract_usage_and_cost(response):
+    usage = getattr(response, "usage_metadata", None)
+    input_tokens = getattr(usage, "prompt_token_count", None) if usage else None
+    output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
+
+    input_cost_usd = None
+    output_cost_usd = None
+    total_cost_usd = None
+    if input_tokens is not None and output_tokens is not None:
+        input_cost_usd = (input_tokens / 1_000_000) * INPUT_COST_PER_1M_TOKENS_USD
+        output_cost_usd = (output_tokens / 1_000_000) * OUTPUT_COST_PER_1M_TOKENS_USD
+        total_cost_usd = input_cost_usd + output_cost_usd
+
+    return input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd
+
+def get_cached_output(cache_key):
+    now_ts = int(time.time())
+    with cache_lock:
+        row = cache_conn.execute(
+            """
+            SELECT output_text
+            FROM llm_cache
+            WHERE cache_key = ?
+              AND (expires_at IS NULL OR expires_at > ?)
+            """,
+            (cache_key, now_ts),
+        ).fetchone()
+    return row[0] if row else None
+
+def set_cached_output(cache_key, output_text, ttl_seconds=None):
+    expires_at = None
+    if ttl_seconds is not None:
+        expires_at = int(time.time()) + int(ttl_seconds)
+    with cache_lock:
+        cache_conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (cache_key, output_text, expires_at) VALUES (?, ?, ?)",
+            (cache_key, output_text, expires_at),
+        )
+        cache_conn.commit()
+
 def translate_text(user_input, target_year):
     if not api_key:
         output_text = "Error: API key not found. Please set GEMINI_API_KEY."
@@ -81,6 +142,11 @@ def translate_text(user_input, target_year):
                 "output_text": output_text,
                 "error_text": "Missing GEMINI_API_KEY",
                 "cache_hit": False,
+                "input_tokens": None,
+                "output_tokens": None,
+                "input_cost_usd": None,
+                "output_cost_usd": None,
+                "total_cost_usd": None,
             }
         )
         return output_text
@@ -89,23 +155,24 @@ def translate_text(user_input, target_year):
 
     cache_input = f"{MODEL_NAME}|{target_year}|{SYSTEM_PROMPT}|{user_input}"
     cache_key = hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
-    with cache_lock:
-        row = cache_conn.execute(
-            "SELECT output_text FROM llm_cache WHERE cache_key = ?",
-            (cache_key,),
-        ).fetchone()
-    if row:
+    cached_output = get_cached_output(cache_key)
+    if cached_output is not None:
         log_request(
             {
                 "model": MODEL_NAME,
                 "target_year": target_year,
                 "input_text": user_input,
-                "output_text": row[0],
+                "output_text": cached_output,
                 "error_text": None,
                 "cache_hit": True,
+                "input_tokens": None,
+                "output_tokens": None,
+                "input_cost_usd": 0.0,
+                "output_cost_usd": 0.0,
+                "total_cost_usd": 0.0,
             }
         )
-        return row[0]
+        return cached_output
     
     try:
         response = client.models.generate_content(
@@ -118,12 +185,8 @@ def translate_text(user_input, target_year):
         
         # Intercept the response and squash multiple newlines down to just one
         cleaned_text = re.sub(r'\n{2,}', '\n', response.text.strip())
-        with cache_lock:
-            cache_conn.execute(
-                "INSERT OR REPLACE INTO llm_cache (cache_key, output_text) VALUES (?, ?)",
-                (cache_key, cleaned_text),
-            )
-            cache_conn.commit()
+        input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd = extract_usage_and_cost(response)
+        set_cached_output(cache_key, cleaned_text)
         log_request(
             {
                 "model": MODEL_NAME,
@@ -132,6 +195,11 @@ def translate_text(user_input, target_year):
                 "output_text": cleaned_text,
                 "error_text": None,
                 "cache_hit": False,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "input_cost_usd": input_cost_usd,
+                "output_cost_usd": output_cost_usd,
+                "total_cost_usd": total_cost_usd,
             }
         )
         
@@ -139,26 +207,12 @@ def translate_text(user_input, target_year):
         
     except Exception as e:
         error_text = str(e)
-        is_quota_error = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
-        if is_quota_error:
-            retry_match = re.search(r"retry in ([\d.]+)s", error_text, re.IGNORECASE)
-            if retry_match:
-                wait_seconds = max(1, int(float(retry_match.group(1)) + 0.999))
-                output_text = (
-                    f"⏳ Too many requests right now. Please wait ~{wait_seconds} seconds and try again."
-                )
-                log_request(
-                    {
-                        "model": MODEL_NAME,
-                        "target_year": target_year,
-                        "input_text": user_input,
-                        "output_text": output_text,
-                        "error_text": error_text,
-                        "cache_hit": False,
-                    }
-                )
-                return output_text
-            output_text = "⏳ Too many requests right now. Please wait a bit and try again."
+        is_unavailable_error = "503" in error_text and "UNAVAILABLE" in error_text
+        if is_unavailable_error:
+            output_text = (
+                "🚦 The model is under high demand right now. Please try again in a minute."
+            )
+            set_cached_output(cache_key, output_text, ttl_seconds=30)
             log_request(
                 {
                     "model": MODEL_NAME,
@@ -167,6 +221,78 @@ def translate_text(user_input, target_year):
                     "output_text": output_text,
                     "error_text": error_text,
                     "cache_hit": False,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "input_cost_usd": None,
+                    "output_cost_usd": None,
+                    "total_cost_usd": None,
+                }
+            )
+            return output_text
+
+        is_quota_error = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
+        if is_quota_error:
+            is_daily_quota = "PerDay" in error_text or "free_tier_requests" in error_text
+            if is_daily_quota:
+                output_text = (
+                    "🚫 Daily free-tier quota reached for this model. Waiting a few seconds won't help. "
+                    "Please try again after the daily reset, switch model, or use a paid quota."
+                )
+                set_cached_output(cache_key, output_text, ttl_seconds=300)
+                log_request(
+                    {
+                        "model": MODEL_NAME,
+                        "target_year": target_year,
+                        "input_text": user_input,
+                        "output_text": output_text,
+                        "error_text": error_text,
+                        "cache_hit": False,
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "input_cost_usd": None,
+                        "output_cost_usd": None,
+                        "total_cost_usd": None,
+                    }
+                )
+                return output_text
+            retry_match = re.search(r"retry in ([\d.]+)s", error_text, re.IGNORECASE)
+            if retry_match:
+                wait_seconds = max(1, int(float(retry_match.group(1)) + 0.999))
+                output_text = (
+                    f"⏳ Too many requests right now. Please wait ~{wait_seconds} seconds and try again."
+                )
+                set_cached_output(cache_key, output_text, ttl_seconds=wait_seconds)
+                log_request(
+                    {
+                        "model": MODEL_NAME,
+                        "target_year": target_year,
+                        "input_text": user_input,
+                        "output_text": output_text,
+                        "error_text": error_text,
+                        "cache_hit": False,
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "input_cost_usd": None,
+                        "output_cost_usd": None,
+                        "total_cost_usd": None,
+                    }
+                )
+                return output_text
+            output_text = "⏳ Too many requests right now. Please wait a bit and try again."
+            set_cached_output(cache_key, output_text, ttl_seconds=20)
+            log_request(
+                {
+                    "model": MODEL_NAME,
+                    "target_year": target_year,
+                    "input_text": user_input,
+                    "output_text": output_text,
+                    "error_text": error_text,
+                    "cache_hit": False,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "input_cost_usd": None,
+                    "output_cost_usd": None,
+                    "total_cost_usd": None,
                 }
             )
             return output_text
@@ -179,6 +305,11 @@ def translate_text(user_input, target_year):
                 "output_text": output_text,
                 "error_text": error_text,
                 "cache_hit": False,
+                "input_tokens": None,
+                "output_tokens": None,
+                "input_cost_usd": None,
+                "output_cost_usd": None,
+                "total_cost_usd": None,
             }
         )
         return output_text
@@ -224,7 +355,7 @@ with gr.Blocks(title="Language Rewinder") as demo:
             submit_btn = gr.Button("Adapt to the Past", variant="primary", size="md")
 
         with gr.Column(scale=1):
-            gr.HTML("<div style='display: inline-block; color: var(--block-label-text-color); font-size: var(--block-label-text-size); font-weight: var(--block-label-text-weight); margin-bottom: -10px; margin-left: 0px; padding: 6px 10px; border-radius: 8px; background-color: rgba(99, 202, 241, 0.18); border: 1px solid rgba(99, 102, 241, 0.35);'>Historical Translation</div>")
+            gr.HTML("<div style='display: inline-block; color: var(--block-label-text-color); font-size: var(--block-label-text-size); font-weight: var(--block-label-text-weight); margin-bottom: -10px; margin-left: 0px; padding: 6px 10px; border-radius: 8px; background-color: rgba(99, 202, 241, 0.18); '>Historical Translation</div>")
             output_text = gr.Markdown(elem_id="white-box")
 
     submit_btn.click(fn=translate_text, inputs=[input_text, year_slider], outputs=output_text)
@@ -237,10 +368,6 @@ with gr.Blocks(title="Language Rewinder") as demo:
             ["J'ai trop le seum, le mec m'a ghosté de ouf.", 1990],
         ],
         inputs=[input_text, year_slider],
-        outputs=output_text,
-        fn=translate_text,
-        run_on_click=True,
-        cache_examples=False,
         label="Try these modern examples"
     )
 
