@@ -29,7 +29,12 @@ The app returns:
 
 ## GitHub Repository
 
-Source code: [github repo](https://github.com/shacharmirkin/lang_rewinder)
+Source code: [github repo](https://github.com/shacharmirkin/language_rewinder)
+
+## Hugging Face Space
+
+The app is also available as a [Hugging Face Space](https://huggingface.co/spaces/shachar/language_rewinder)
+
 
 ## License
 
@@ -39,4 +44,5 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 This project is a simple AI-assisted linguistic simulation, not a profound linguistic reconstruction tool. Outputs may contain inaccuracies, oversimplifications, or stylistic artifacts from the model. 
 
-⚠️ For observability and cost tracking, request/response text may be logged by the app runtime. Do not submit sensitive personal, private, or regulated data. Account names and other personal data are not logged.
+⚠️ For debugging and cost tracking, request/response texts are logged by the app runtime. Do not submit sensitive personal, private, or regulated data. 
+Account names and other personal data are not logged.
