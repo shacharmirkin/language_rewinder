@@ -108,12 +108,13 @@ pyasn1-modules==0.4.2
     # via google-auth
 pycparser==3.0
     # via cffi
-pydantic==2.13.3
+pydantic==2.12.5
     # via
+    #   ling-time-machine (pyproject.toml)
     #   fastapi
     #   google-genai
     #   gradio
-pydantic-core==2.46.3
+pydantic-core==2.41.5
     # via pydantic
 pydub==0.25.1
     # via gradio

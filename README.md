@@ -1,7 +1,7 @@
 ---
 title: Language Rewinder
-emoji: 🔁
-colorFrom: blue
+emoji: ⏪
+colorFrom: green
 colorTo: indigo
 sdk: gradio
 sdk_version: "6.14.0"
