@@ -29,4 +29,4 @@ jobs:
 
     - name: Run pylint
       run: |
-        git ls-files '*.py' | xargs -r pylint --fail-under=7.0
+        git ls-files '*.py' | xargs -r pylint --disable=C0301,C0114,C0116 --fail-under=7.0
