@@ -1,12 +1,20 @@
 [project]
-name = "ling-time-machine"
+name = "language_rewinder"
 version = "0.1.0"
-description = "Add your description here"
+description = "Convert modern talk to historical language"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "google-genai>=1.74.0",
     "gradio>=6.14.0",
     "pydantic<=2.12.5",
+    "psutil<6",
     "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "huggingface-hub>=1.13.0",
+    "pytest>=8.3.0",
 ]
