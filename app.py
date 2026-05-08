@@ -1,19 +1,20 @@
+from datetime import datetime, timezone
+import hashlib
+import json
+import logging
 import os
-import sys
-import traceback
-import gradio as gr
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
+import random
 import re
 import sqlite3
-import hashlib
+import sys
 import threading
-import logging
-import json
-from datetime import datetime, timezone
 import time
-import random
+import traceback
+
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+import gradio as gr
 import yaml
 
 load_dotenv()
@@ -130,7 +131,7 @@ def log_request(event_data):
     }
     logger.info(json.dumps(payload, ensure_ascii=False))
 
-def normalize_output_text(raw_text, target_year):
+def normalize_output_text(raw_text):
     lines = raw_text.strip().splitlines()
     normalized_lines = []
     for line in lines:
@@ -187,14 +188,14 @@ def get_cached_output(cache_key):
         ).fetchone()
     return row[0] if row else None
 
-def set_cached_output(cache_key, output_text, ttl_seconds=None):
+def set_cached_output(cache_key, cached_text, ttl_seconds=None):
     expires_at = None
     if ttl_seconds is not None:
         expires_at = int(time.time()) + int(ttl_seconds)
     with cache_lock:
         cache_conn.execute(
             "INSERT OR REPLACE INTO llm_cache (cache_key, output_text, expires_at) VALUES (?, ?, ?)",
-            (cache_key, output_text, expires_at),
+            (cache_key, cached_text, expires_at),
         )
         cache_conn.commit()
 
@@ -221,16 +222,16 @@ def generate_with_retry(model_name, system_prompt, contents, retry_count, initia
                 contents=contents,
             )
             return response, None
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             error_text = str(e)
             if not is_503_error(error_text) or attempt >= retry_count:
                 return None, e
             base_wait_seconds = initial_backoff_seconds * (2**attempt)
-            jitter_seconds = max(0.2, random.uniform(0, base_wait_seconds))
+            jitter_seconds = random.uniform(0.2, base_wait_seconds)
             time.sleep(jitter_seconds)
             attempt += 1
 
-def translate_text(user_input, target_year, show_all=False):
+def translate_text(user_input, target_year, show_all=False):  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
     if not api_key:
         output_text = "Error: API key not found. Please set GEMINI_API_KEY."
         log_request(
@@ -266,7 +267,7 @@ def translate_text(user_input, target_year, show_all=False):
     cache_key = hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
     cached_output = get_cached_output(cache_key)
     if cached_output is not None:
-        normalized_cached_output = cached_output if show_all else normalize_output_text(cached_output, target_year)
+        normalized_cached_output = cached_output if show_all else normalize_output_text(cached_output)
         log_request(
             {
                 "model": MODEL_NAME,
@@ -326,7 +327,7 @@ def translate_text(user_input, target_year, show_all=False):
         responded_model = FALLBACK_MODEL_NAME if response is not None else MODEL_NAME
 
     if response is not None:
-        cleaned_text = response.text if show_all else normalize_output_text(response.text, target_year)
+        cleaned_text = response.text if show_all else normalize_output_text(response.text)
         input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd = extract_usage_and_cost(response)
         set_cached_output(cache_key, cleaned_text)
         log_request(
@@ -468,7 +469,7 @@ theme = gr.themes.Soft(
     primary_hue="indigo",
 )
 
-css = """
+CSS = """
 #white-box {
     background-color: var(--input-background-fill);
     border: var(--input-border-width) solid var(--input-border-color);
@@ -481,10 +482,10 @@ css = """
 }
 """
 
-with gr.Blocks(title="Language Rewinder", theme=theme, css=css) as demo:
+with gr.Blocks(title="Language Rewinder", theme=theme, css=CSS) as demo:
     gr.Markdown("# ⏪ Language Rewinder")
     gr.Markdown("Adapt your writing for historical accuracy and translate modern slang into the language of the past.")
-    
+
     # NEW: Removed equal_height=True so the columns operate independently
     with gr.Row():
         with gr.Column(scale=1):
@@ -501,30 +502,30 @@ with gr.Blocks(title="Language Rewinder", theme=theme, css=css) as demo:
                 step=5,
                 label="Target Era"
             )
-            show_all = gr.Checkbox(label="Show all", value=False)
+            show_all_checkbox = gr.Checkbox(label="Show all", value=False)
             submit_btn = gr.Button("Adapt to the Past", variant="primary", size="md")
 
         with gr.Column(scale=1):
             gr.HTML("<div style='display: inline-block; color: var(--block-label-text-color); font-size: var(--block-label-text-size); font-weight: var(--block-label-text-weight); margin-bottom: -10px; margin-left: 0px; padding: 6px 10px; border-radius: 8px; background-color: rgba(99, 202, 241, 0.18); '>Historical Translation</div>")
-            output_text = gr.Markdown(elem_id="white-box")
+            output_markdown = gr.Markdown(elem_id="white-box")
 
-    show_all.change(
+    show_all_checkbox.change(  # pylint: disable=no-member
         fn=lambda checked: gr.update(interactive=not checked),
-        inputs=show_all,
+        inputs=show_all_checkbox,
         outputs=year_slider,
         api_name=False,
     )
 
-    submit_btn.click(
+    submit_btn.click(  # pylint: disable=no-member
         fn=translate_text,
-        inputs=[input_text, year_slider, show_all],
-        outputs=output_text,
+        inputs=[input_text, year_slider, show_all_checkbox],
+        outputs=output_markdown,
         api_name=False,
     )
-    input_text.submit(
+    input_text.submit(  # pylint: disable=no-member
         fn=translate_text,
-        inputs=[input_text, year_slider, show_all],
-        outputs=output_text,
+        inputs=[input_text, year_slider, show_all_checkbox],
+        outputs=output_markdown,
         api_name=False,
     )
 
