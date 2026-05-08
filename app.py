@@ -1,4 +1,6 @@
 import os
+import sys
+import traceback
 import gradio as gr
 from google import genai
 from google.genai import types
@@ -15,6 +17,7 @@ import random
 import yaml
 
 load_dotenv()
+print("BOOT_STAGE: dotenv_loaded")
 
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
@@ -478,7 +481,7 @@ css = """
 }
 """
 
-with gr.Blocks(title="Language Rewinder") as demo:
+with gr.Blocks(title="Language Rewinder", theme=theme, css=css) as demo:
     gr.Markdown("# ⏪ Language Rewinder")
     gr.Markdown("Adapt your writing for historical accuracy and translate modern slang into the language of the past.")
     
@@ -509,10 +512,21 @@ with gr.Blocks(title="Language Rewinder") as demo:
         fn=lambda checked: gr.update(interactive=not checked),
         inputs=show_all,
         outputs=year_slider,
+        api_name=False,
     )
 
-    submit_btn.click(fn=translate_text, inputs=[input_text, year_slider, show_all], outputs=output_text)
-    input_text.submit(fn=translate_text, inputs=[input_text, year_slider, show_all], outputs=output_text)
+    submit_btn.click(
+        fn=translate_text,
+        inputs=[input_text, year_slider, show_all],
+        outputs=output_text,
+        api_name=False,
+    )
+    input_text.submit(
+        fn=translate_text,
+        inputs=[input_text, year_slider, show_all],
+        outputs=output_text,
+        api_name=False,
+    )
 
     gr.Examples(
         examples=[
@@ -524,10 +538,14 @@ with gr.Blocks(title="Language Rewinder") as demo:
         label="Try these modern examples"
     )
 
-demo.queue(default_concurrency_limit=5, max_size=10).launch(
-    server_name="0.0.0.0",
-    server_port=int(os.environ.get("PORT", 7860)),
-    ssr_mode=False,
-    theme=theme,
-    css=css,
-)
+print("BOOT_STAGE: gradio_launch_start")
+try:
+    demo.queue(default_concurrency_limit=5, max_size=10, api_open=False).launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+        ssr_mode=False,
+    )
+except Exception:
+    print("BOOT_STAGE: fatal_startup_exception")
+    traceback.print_exc(file=sys.stdout)
+    raise
