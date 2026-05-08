@@ -1,0 +1,8 @@
+models:
+  main: "gemini-2.5-flash"
+  fallback: "gemini-2.5-flash-lite"
+
+decades:
+  start_year: 1900
+  end_year: 2020
+  interval: 1

@@ -11,13 +11,25 @@ import logging
 import json
 from datetime import datetime, timezone
 import time
+import random
+import yaml
 
 load_dotenv()
 
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
-#MODEL_NAME = "gemini-3.1-flash-lite-preview"
-MODEL_NAME = "gemini-2.5-flash"
+
+def load_app_config():
+    config_path = os.environ.get("LANG_REWINDER_CONFIG_PATH", "config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+APP_CONFIG = load_app_config()
+MODEL_NAME = APP_CONFIG["models"]["main"]
+FALLBACK_MODEL_NAME = APP_CONFIG["models"]["fallback"]
+DECADE_START_YEAR = APP_CONFIG["decades"]["start_year"]
+DECADE_END_YEAR = APP_CONFIG["decades"]["end_year"]
+DECADE_INTERVAL = APP_CONFIG["decades"]["interval"]
 
 def pick_storage_root():
     if os.environ.get("LTM_STORAGE_DIR"):
@@ -89,6 +101,22 @@ OUTPUT FORMAT (MANDATORY):
 - Then write only the translated text.
 - Then write exactly this header on its own line: **Etymology Note:**
 - Then 2-4 short bullet points.
+"""
+
+ALL_DECADES_SYSTEM_PROMPT = """
+You are a Historical Linguist and Translator. Rewrite modern text into the style of multiple target decades.
+
+RULES:
+1. Keep the same language as the input text.
+2. Return short translations only, no explanations and no etymology notes.
+3. Follow each decade label exactly as provided.
+
+OUTPUT FORMAT (MANDATORY):
+- Return a Markdown table only.
+- Header must be exactly:
+| Decade | Translation |
+|---|---|
+- Then one row per requested decade.
 """
 
 def log_request(event_data):
@@ -167,13 +195,46 @@ def set_cached_output(cache_key, output_text, ttl_seconds=None):
         )
         cache_conn.commit()
 
-def translate_text(user_input, target_year):
+def is_503_error(error_text):
+    upper_error = error_text.upper()
+    return "503" in upper_error and "UNAVAILABLE" in upper_error
+
+def get_show_all_years():
+    years = []
+    step_years = DECADE_INTERVAL * 10
+    current = DECADE_START_YEAR
+    while current <= DECADE_END_YEAR:
+        years.append(current)
+        current += step_years
+    return years
+
+def generate_with_retry(model_name, system_prompt, contents, retry_count, initial_backoff_seconds):
+    attempt = 0
+    while True:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                config=types.GenerateContentConfig(system_instruction=system_prompt),
+                contents=contents,
+            )
+            return response, None
+        except Exception as e:
+            error_text = str(e)
+            if not is_503_error(error_text) or attempt >= retry_count:
+                return None, e
+            base_wait_seconds = initial_backoff_seconds * (2**attempt)
+            jitter_seconds = max(0.2, random.uniform(0, base_wait_seconds))
+            time.sleep(jitter_seconds)
+            attempt += 1
+
+def translate_text(user_input, target_year, show_all=False):
     if not api_key:
         output_text = "Error: API key not found. Please set GEMINI_API_KEY."
         log_request(
             {
                 "model": MODEL_NAME,
                 "target_year": target_year,
+                "show_all": show_all,
                 "input_text": user_input,
                 "output_text": output_text,
                 "error_text": "Missing GEMINI_API_KEY",
@@ -189,15 +250,26 @@ def translate_text(user_input, target_year):
     if not user_input.strip():
         return ""
 
-    cache_input = f"{MODEL_NAME}|{target_year}|{SYSTEM_PROMPT}|{user_input}"
+    active_prompt = SYSTEM_PROMPT
+    active_target = str(target_year)
+    response_format_mode = "single"
+    if show_all:
+        years = get_show_all_years()
+        active_target = ",".join(str(year) for year in years)
+        active_prompt = ALL_DECADES_SYSTEM_PROMPT
+        response_format_mode = "all_decades"
+
+    cache_input = f"{MODEL_NAME}|{FALLBACK_MODEL_NAME}|{active_target}|{response_format_mode}|{active_prompt}|{user_input}"
     cache_key = hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
     cached_output = get_cached_output(cache_key)
     if cached_output is not None:
-        normalized_cached_output = normalize_output_text(cached_output, target_year)
+        normalized_cached_output = cached_output if show_all else normalize_output_text(cached_output, target_year)
         log_request(
             {
                 "model": MODEL_NAME,
+                "responded_model": "cache",
                 "target_year": target_year,
+                "show_all": show_all,
                 "input_text": user_input,
                 "output_text": normalized_cached_output,
                 "error_text": None,
@@ -210,28 +282,56 @@ def translate_text(user_input, target_year):
             }
         )
         return normalized_cached_output
-    
-    try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT
-            ),
-            contents=(
-                f"Target Year: {target_year}\n"
-                "Follow the exact output format from the system prompt. "
-                "Do not add any extra label before the translation body.\n"
-                f"Text: {user_input}"
-            )
+
+    if show_all:
+        years = get_show_all_years()
+        contents = (
+            f"Target Decades: {', '.join(str(year) for year in years)}\n"
+            "Return only the Markdown table with one row per requested decade.\n"
+            f"Text: {user_input}"
         )
-        
-        cleaned_text = normalize_output_text(response.text, target_year)
+    else:
+        contents = (
+            f"Target Year: {target_year}\n"
+            "Follow the exact output format from the system prompt. "
+            "Do not add any extra label before the translation body.\n"
+            f"Text: {user_input}"
+        )
+
+    primary_response, primary_error = generate_with_retry(
+        model_name=MODEL_NAME,
+        system_prompt=active_prompt,
+        contents=contents,
+        retry_count=0,
+        initial_backoff_seconds=1,
+    )
+
+    responded_model = MODEL_NAME
+    response = primary_response
+    error = primary_error
+
+    if response is None and error is not None and is_503_error(str(error)):
+        fallback_response, fallback_error = generate_with_retry(
+            model_name=FALLBACK_MODEL_NAME,
+            system_prompt=active_prompt,
+            contents=contents,
+            retry_count=3,
+            initial_backoff_seconds=1,
+        )
+        response = fallback_response
+        error = fallback_error
+        responded_model = FALLBACK_MODEL_NAME if response is not None else MODEL_NAME
+
+    if response is not None:
+        cleaned_text = response.text if show_all else normalize_output_text(response.text, target_year)
         input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd = extract_usage_and_cost(response)
         set_cached_output(cache_key, cleaned_text)
         log_request(
             {
                 "model": MODEL_NAME,
+                "responded_model": responded_model,
                 "target_year": target_year,
+                "show_all": show_all,
                 "input_text": user_input,
                 "output_text": cleaned_text,
                 "error_text": None,
@@ -243,105 +343,19 @@ def translate_text(user_input, target_year):
                 "total_cost_usd": total_cost_usd,
             }
         )
-        
         return cleaned_text
-        
-    except Exception as e:
-        error_text = str(e)
-        is_unavailable_error = "503" in error_text and "UNAVAILABLE" in error_text
-        if is_unavailable_error:
-            output_text = (
-                "🚦 The model is under high demand right now. Please try again in a minute."
-            )
-            set_cached_output(cache_key, output_text, ttl_seconds=30)
-            log_request(
-                {
-                    "model": MODEL_NAME,
-                    "target_year": target_year,
-                    "input_text": user_input,
-                    "output_text": output_text,
-                    "error_text": error_text,
-                    "cache_hit": False,
-                    "input_tokens": None,
-                    "output_tokens": None,
-                    "input_cost_usd": None,
-                    "output_cost_usd": None,
-                    "total_cost_usd": None,
-                }
-            )
-            return output_text
 
-        is_quota_error = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
-        if is_quota_error:
-            is_daily_quota = "PerDay" in error_text or "free_tier_requests" in error_text
-            if is_daily_quota:
-                output_text = (
-                    "🚫 Daily free-tier quota reached for this model. Waiting a few seconds won't help. "
-                    "Please try again after the daily reset, switch model, or use a paid quota."
-                )
-                set_cached_output(cache_key, output_text, ttl_seconds=300)
-                log_request(
-                    {
-                        "model": MODEL_NAME,
-                        "target_year": target_year,
-                        "input_text": user_input,
-                        "output_text": output_text,
-                        "error_text": error_text,
-                        "cache_hit": False,
-                        "input_tokens": None,
-                        "output_tokens": None,
-                        "input_cost_usd": None,
-                        "output_cost_usd": None,
-                        "total_cost_usd": None,
-                    }
-                )
-                return output_text
-            retry_match = re.search(r"retry in ([\d.]+)s", error_text, re.IGNORECASE)
-            if retry_match:
-                wait_seconds = max(1, int(float(retry_match.group(1)) + 0.999))
-                output_text = (
-                    f"⏳ Too many requests right now. Please wait ~{wait_seconds} seconds and try again."
-                )
-                set_cached_output(cache_key, output_text, ttl_seconds=wait_seconds)
-                log_request(
-                    {
-                        "model": MODEL_NAME,
-                        "target_year": target_year,
-                        "input_text": user_input,
-                        "output_text": output_text,
-                        "error_text": error_text,
-                        "cache_hit": False,
-                        "input_tokens": None,
-                        "output_tokens": None,
-                        "input_cost_usd": None,
-                        "output_cost_usd": None,
-                        "total_cost_usd": None,
-                    }
-                )
-                return output_text
-            output_text = "⏳ Too many requests right now. Please wait a bit and try again."
-            set_cached_output(cache_key, output_text, ttl_seconds=20)
-            log_request(
-                {
-                    "model": MODEL_NAME,
-                    "target_year": target_year,
-                    "input_text": user_input,
-                    "output_text": output_text,
-                    "error_text": error_text,
-                    "cache_hit": False,
-                    "input_tokens": None,
-                    "output_tokens": None,
-                    "input_cost_usd": None,
-                    "output_cost_usd": None,
-                    "total_cost_usd": None,
-                }
-            )
-            return output_text
-        output_text = f"Error: {error_text}"
+    error_text = str(error) if error is not None else "Unknown generation error"
+    is_unavailable_error = is_503_error(error_text)
+    if is_unavailable_error:
+        output_text = "🚦 The models are under high demand right now. Please try again in a minute."
+        set_cached_output(cache_key, output_text, ttl_seconds=30)
         log_request(
             {
                 "model": MODEL_NAME,
+                "responded_model": "none",
                 "target_year": target_year,
+                "show_all": show_all,
                 "input_text": user_input,
                 "output_text": output_text,
                 "error_text": error_text,
@@ -354,6 +368,97 @@ def translate_text(user_input, target_year):
             }
         )
         return output_text
+
+    is_quota_error = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
+    if is_quota_error:
+        is_daily_quota = "PerDay" in error_text or "free_tier_requests" in error_text
+        if is_daily_quota:
+            output_text = (
+                "🚫 Daily free-tier quota reached for this model. Waiting a few seconds won't help. "
+                "Please try again after the daily reset, switch model, or use a paid quota."
+            )
+            set_cached_output(cache_key, output_text, ttl_seconds=300)
+            log_request(
+                {
+                    "model": MODEL_NAME,
+                    "responded_model": "none",
+                    "target_year": target_year,
+                    "show_all": show_all,
+                    "input_text": user_input,
+                    "output_text": output_text,
+                    "error_text": error_text,
+                    "cache_hit": False,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "input_cost_usd": None,
+                    "output_cost_usd": None,
+                    "total_cost_usd": None,
+                }
+            )
+            return output_text
+        retry_match = re.search(r"retry in ([\d.]+)s", error_text, re.IGNORECASE)
+        if retry_match:
+            wait_seconds = max(1, int(float(retry_match.group(1)) + 0.999))
+            output_text = f"⏳ Too many requests right now. Please wait ~{wait_seconds} seconds and try again."
+            set_cached_output(cache_key, output_text, ttl_seconds=wait_seconds)
+            log_request(
+                {
+                    "model": MODEL_NAME,
+                    "responded_model": "none",
+                    "target_year": target_year,
+                    "show_all": show_all,
+                    "input_text": user_input,
+                    "output_text": output_text,
+                    "error_text": error_text,
+                    "cache_hit": False,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "input_cost_usd": None,
+                    "output_cost_usd": None,
+                    "total_cost_usd": None,
+                }
+            )
+            return output_text
+        output_text = "⏳ Too many requests right now. Please wait a bit and try again."
+        set_cached_output(cache_key, output_text, ttl_seconds=20)
+        log_request(
+            {
+                "model": MODEL_NAME,
+                "responded_model": "none",
+                "target_year": target_year,
+                "show_all": show_all,
+                "input_text": user_input,
+                "output_text": output_text,
+                "error_text": error_text,
+                "cache_hit": False,
+                "input_tokens": None,
+                "output_tokens": None,
+                "input_cost_usd": None,
+                "output_cost_usd": None,
+                "total_cost_usd": None,
+            }
+        )
+        return output_text
+
+    output_text = f"Error: {error_text}"
+    log_request(
+        {
+            "model": MODEL_NAME,
+            "responded_model": "none",
+            "target_year": target_year,
+            "show_all": show_all,
+            "input_text": user_input,
+            "output_text": output_text,
+            "error_text": error_text,
+            "cache_hit": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "input_cost_usd": None,
+            "output_cost_usd": None,
+            "total_cost_usd": None,
+        }
+    )
+    return output_text
 
 theme = gr.themes.Soft(
     font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
@@ -393,14 +498,21 @@ with gr.Blocks(title="Language Rewinder") as demo:
                 step=5,
                 label="Target Era"
             )
+            show_all = gr.Checkbox(label="Show all", value=False)
             submit_btn = gr.Button("Adapt to the Past", variant="primary", size="md")
 
         with gr.Column(scale=1):
             gr.HTML("<div style='display: inline-block; color: var(--block-label-text-color); font-size: var(--block-label-text-size); font-weight: var(--block-label-text-weight); margin-bottom: -10px; margin-left: 0px; padding: 6px 10px; border-radius: 8px; background-color: rgba(99, 202, 241, 0.18); '>Historical Translation</div>")
             output_text = gr.Markdown(elem_id="white-box")
 
-    submit_btn.click(fn=translate_text, inputs=[input_text, year_slider], outputs=output_text)
-    input_text.submit(fn=translate_text, inputs=[input_text, year_slider], outputs=output_text)
+    show_all.change(
+        fn=lambda checked: gr.update(interactive=not checked),
+        inputs=show_all,
+        outputs=year_slider,
+    )
+
+    submit_btn.click(fn=translate_text, inputs=[input_text, year_slider, show_all], outputs=output_text)
+    input_text.submit(fn=translate_text, inputs=[input_text, year_slider, show_all], outputs=output_text)
 
     gr.Examples(
         examples=[
@@ -412,7 +524,7 @@ with gr.Blocks(title="Language Rewinder") as demo:
         label="Try these modern examples"
     )
 
-demo.queue(default_concurrency_limit=5).launch(
+demo.queue(default_concurrency_limit=5, max_size=10).launch(
     server_name="0.0.0.0",
     server_port=int(os.environ.get("PORT", 7860)),
     ssr_mode=False,
