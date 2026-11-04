@@ -33,7 +33,7 @@ distro==1.9.0
     # via google-genai
 fastapi==0.136.1
     # via gradio
-filelock==3.29.0
+filelock==4.2.1
     # via huggingface-hub
 fsspec==2026.4.0
     # via
