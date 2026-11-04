@@ -72,7 +72,7 @@ huggingface-hub==1.13.0
     # via
     #   gradio
     #   gradio-client
-idna==3.13
+idna==3.20
     # via
     #   anyio
     #   httpx
