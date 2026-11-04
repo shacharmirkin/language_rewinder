@@ -116,7 +116,7 @@ packaging==26.2
     #   huggingface-hub
 pandas==2.3.3
     # via gradio
-pillow==13.0.0
+pillow==12.3.0
     # via
     #   --override (workspace)
     #   gradio
