@@ -100,7 +100,7 @@ packaging==26.2
     #   huggingface-hub
 pandas==2.3.3
     # via gradio
-pillow==11.3.0
+pillow==13.0.0
     # via gradio
 psutil==5.9.8
     # via language-rewinder (pyproject.toml)
