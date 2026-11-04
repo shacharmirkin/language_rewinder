@@ -91,7 +91,7 @@ numpy==2.4.4
     # via
     #   gradio
     #   pandas
-orjson==3.11.8
+orjson==3.13.0
     # via gradio
 packaging==26.2
     # via
