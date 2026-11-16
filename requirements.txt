@@ -54,7 +54,7 @@ google-auth==2.50.0
     # via google-genai
 google-genai==1.74.0
     # via language-rewinder (pyproject.toml)
-gradio==6.31.0
+gradio==6.32.0
     # via language-rewinder (pyproject.toml)
 gradio-client==2.7.2
     # via
@@ -116,7 +116,7 @@ packaging==26.2
     #   huggingface-hub
 pandas==2.3.3
     # via gradio
-pillow==12.3.0
+pillow==13.0.0
     # via
     #   --override (workspace)
     #   gradio
