@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "google-genai>=1.74.0",
-    "gradio>=6.15.0",
+    "gradio>=6.32.0",
     "pydantic<=2.12.5",
     "psutil<6",
     "python-dotenv>=1.2.2",
@@ -25,7 +25,7 @@ override-dependencies = [
     "urllib3>=2.8.0",
     "pyasn1>=0.6.5",
     "python-multipart>=0.0.30",
-    "pillow>=12.3.0,<13",
+    "pillow>=13.0.0,<14",
     "anyio>=4.14.2",
     "cryptography>=50.0.0",
     "brotli>=1.2.1",
